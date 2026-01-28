@@ -26,3 +26,9 @@ index.csv
 claude.md
 initial_prompt.md
 debug_transcript.py
+
+# Claude Code
+.claude/
+
+# Duplicate subdirectory (if exists)
+transcriptGrabber/

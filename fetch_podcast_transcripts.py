@@ -30,11 +30,20 @@ import sys
 import re
 import csv
 import argparse
+import time
+import random
 from datetime import datetime, timezone
 from dateutil.relativedelta import relativedelta
 from pathlib import Path
 from typing import Optional, List, Dict
 import json
+
+# Rate limiting configuration
+DEFAULT_DELAY_BETWEEN_TRANSCRIPTS = 2  # seconds between each transcript fetch
+DEFAULT_BATCH_SIZE = 10  # number of transcripts per batch
+DEFAULT_BATCH_PAUSE = 30  # seconds to pause between batches
+MAX_RETRIES = 5  # maximum retries for rate-limited requests
+INITIAL_BACKOFF = 5  # initial backoff time in seconds
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -49,8 +58,8 @@ from dotenv import load_dotenv
 # Load environment variables from .env file if present
 load_dotenv()
 
-# Default output directory (WSL2 path to Windows folder)
-DEFAULT_OUTPUT_DIR = "/mnt/c/Users/14102/Documents/Sebastian Ames/Projects/Moonshots Transcripts"
+# Default output directory
+DEFAULT_OUTPUT_DIR = r"C:\Users\14102\Documents\Sebastian Ames\Projects\Moonshots Transcripts"
 
 
 def resolve_channel_id(youtube, channel_url: str) -> Optional[str]:
@@ -306,43 +315,64 @@ def parse_iso_duration(duration: str) -> int:
     return hours * 3600 + minutes * 60 + seconds
 
 
-def fetch_transcript(video_id: str) -> Optional[str]:
+def fetch_transcript_with_retry(video_id: str, max_retries: int = MAX_RETRIES) -> Optional[str]:
     """
-    Fetch English transcript for a video.
+    Fetch English transcript for a video with retry logic for rate limiting.
 
     Args:
         video_id: YouTube video ID
+        max_retries: Maximum number of retries for rate-limited requests
 
     Returns:
         Full transcript text, or None if not available
     """
-    try:
-        # Create API instance
-        api = YouTubeTranscriptApi()
+    backoff = INITIAL_BACKOFF
 
-        # Try to fetch English transcript (will auto-select best English variant)
-        segments = api.fetch(video_id, languages=['en'])
+    for attempt in range(max_retries + 1):
+        try:
+            # Create API instance
+            api = YouTubeTranscriptApi()
 
-        # Concatenate all text segments
-        full_text = ' '.join([segment.text for segment in segments])
-        print(f"  ✓ Found English transcript ({len(segments)} segments)")
-        return full_text
+            # Try to fetch English transcript (will auto-select best English variant)
+            segments = api.fetch(video_id, languages=['en'])
 
-    except NoTranscriptFound:
-        print(f"  ✗ No English transcript found")
-        return None
+            # Concatenate all text segments
+            full_text = ' '.join([segment.text for segment in segments])
+            print(f"  [OK] Found English transcript ({len(segments)} segments)")
+            return full_text
 
-    except TranscriptsDisabled:
-        print(f"  ✗ Transcripts disabled")
-        return None
+        except NoTranscriptFound:
+            print(f"  [SKIP] No English transcript found")
+            return None
 
-    except VideoUnavailable:
-        print(f"  ✗ Video unavailable")
-        return None
+        except TranscriptsDisabled:
+            print(f"  [SKIP] Transcripts disabled")
+            return None
 
-    except Exception as e:
-        print(f"  ✗ Error: {e}")
-        return None
+        except VideoUnavailable:
+            print(f"  [SKIP] Video unavailable")
+            return None
+
+        except Exception as e:
+            error_str = str(e).lower()
+            # Check if it's a rate limit error (HTTP 429 or similar)
+            if '429' in error_str or 'too many requests' in error_str or 'rate' in error_str:
+                if attempt < max_retries:
+                    # Add jitter to avoid thundering herd
+                    jitter = random.uniform(0, backoff * 0.5)
+                    wait_time = backoff + jitter
+                    print(f"  [RATE LIMITED] Waiting {wait_time:.1f}s before retry ({attempt + 1}/{max_retries})...")
+                    time.sleep(wait_time)
+                    backoff *= 2  # Exponential backoff
+                    continue
+                else:
+                    print(f"  [ERROR] Rate limited after {max_retries} retries")
+                    return None
+            else:
+                print(f"  [ERROR] {e}")
+                return None
+
+    return None
 
 
 def sanitize_filename(title: str) -> str:
@@ -479,8 +509,33 @@ def main():
         type=int,
         help='Maximum video duration in seconds'
     )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f'Number of transcripts to fetch per batch (default: {DEFAULT_BATCH_SIZE})'
+    )
+    parser.add_argument(
+        '--batch-pause',
+        type=int,
+        default=DEFAULT_BATCH_PAUSE,
+        help=f'Seconds to pause between batches (default: {DEFAULT_BATCH_PAUSE})'
+    )
+    parser.add_argument(
+        '--delay',
+        type=float,
+        default=DEFAULT_DELAY_BETWEEN_TRANSCRIPTS,
+        help=f'Seconds to wait between each transcript fetch (default: {DEFAULT_DELAY_BETWEEN_TRANSCRIPTS})'
+    )
 
     args = parser.parse_args()
+
+    # Prompt for output directory if not provided via command line
+    if args.output_dir == DEFAULT_OUTPUT_DIR:
+        print(f"\nDefault output directory: {DEFAULT_OUTPUT_DIR}")
+        user_input = input("Enter output directory (or press Enter to use default): ").strip()
+        if user_input:
+            args.output_dir = user_input
 
     # Validate inputs
     if not args.channel_url and not args.playlist_id:
@@ -540,7 +595,14 @@ def main():
         print("No videos found matching the criteria")
         sys.exit(0)
 
-    print(f"\nProcessing {len(videos)} videos...")
+    total_videos = len(videos)
+    total_batches = (total_videos + args.batch_size - 1) // args.batch_size
+
+    print(f"\nProcessing {total_videos} videos...")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Total batches: {total_batches}")
+    print(f"  Delay between transcripts: {args.delay}s")
+    print(f"  Pause between batches: {args.batch_pause}s")
 
     # Fetch transcripts and write files
     success_count = 0
@@ -549,11 +611,12 @@ def main():
     for i, video in enumerate(videos, 1):
         video_id = video['video_id']
         title = video['title']
+        current_batch = (i - 1) // args.batch_size + 1
 
-        print(f"\n[{i}/{len(videos)}] Fetching transcript for: {title}")
+        print(f"\n[{i}/{total_videos}] (Batch {current_batch}/{total_batches}) Fetching transcript for: {title}")
         print(f"  Video ID: {video_id}")
 
-        transcript = fetch_transcript(video_id)
+        transcript = fetch_transcript_with_retry(video_id)
 
         if transcript:
             # Write transcript file
@@ -561,12 +624,25 @@ def main():
             video['has_transcript'] = True
             video['transcript_path'] = filename
             success_count += 1
-            print(f"  ✓ Wrote transcript to: {filename}")
+            print(f"  [OK] Wrote transcript to: {filename}")
         else:
             video['has_transcript'] = False
             video['transcript_path'] = ''
             skip_count += 1
-            print(f"  ✗ No English transcript available")
+            print(f"  [SKIP] No English transcript available")
+
+        # Rate limiting: delay between requests
+        if i < total_videos:
+            # Check if we've completed a batch
+            if i % args.batch_size == 0:
+                print(f"\n{'='*60}")
+                print(f"Batch {current_batch}/{total_batches} complete. Pausing for {args.batch_pause} seconds...")
+                print(f"Progress: {success_count} downloaded, {skip_count} skipped")
+                print(f"{'='*60}")
+                time.sleep(args.batch_pause)
+            else:
+                # Normal delay between transcripts
+                time.sleep(args.delay)
 
     # Write index CSV
     write_index_csv(videos, output_dir)

@@ -12,6 +12,9 @@ A production-quality Python script to fetch YouTube transcripts from podcast cha
 - ✅ Automatic pagination for large channels
 - ✅ CSV index file with all metadata
 - ✅ Individual text files per video with metadata headers
+- ✅ **Rate limiting protection** with configurable batch processing
+- ✅ **Exponential backoff** for automatic retry on rate limit errors
+- ✅ **Interactive output directory prompt** - choose where to save files
 
 ## Prerequisites
 
@@ -91,15 +94,16 @@ python fetch_podcast_transcripts.py \
 | `--channel-url` | YouTube channel URL (e.g., `https://www.youtube.com/@ChannelName`) | Required* |
 | `--playlist-id` | YouTube playlist ID | Required* |
 | `--months-back` | Number of months to look back from today | `3` |
-| `--output-dir` | Directory to save transcripts | Platform-specific** |
+| `--output-dir` | Directory to save transcripts | Interactive prompt** |
 | `--min-duration` | Minimum video duration in seconds (e.g., `300` for 5 min) | None |
 | `--max-duration` | Maximum video duration in seconds (e.g., `7200` for 2 hours) | None |
+| `--batch-size` | Number of transcripts to fetch per batch | `10` |
+| `--batch-pause` | Seconds to pause between batches | `30` |
+| `--delay` | Seconds to wait between each transcript fetch | `2` |
 
 \* Either `--channel-url` or `--playlist-id` is required (but not both)
 
-\*\* Default output directory:
-- Linux/WSL: `/mnt/c/Users/14102/Documents/Sebastian Ames/Projects/Moonshots Transcripts`
-- You can customize this in the script or use `--output-dir`
+\*\* If no `--output-dir` is provided, the script will prompt you to enter a directory or press Enter to use the default
 
 ## Output
 
@@ -190,6 +194,29 @@ YouTube Data API has daily quotas. If exceeded:
 2. Request quota increase in Google Cloud Console
 3. Use multiple API keys (manual rotation)
 
+### Rate Limiting (HTTP 429 Errors)
+
+The script includes built-in rate limiting protection:
+
+1. **Automatic retry with exponential backoff** - If rate limited, the script waits and retries automatically
+2. **Configurable delays** - Adjust timing to avoid rate limits:
+
+```bash
+# Conservative settings (slower but safer)
+python fetch_podcast_transcripts.py \
+    --channel-url "https://www.youtube.com/@ChannelName" \
+    --batch-size 5 \
+    --batch-pause 60 \
+    --delay 3
+
+# Faster settings (if you haven't had issues)
+python fetch_podcast_transcripts.py \
+    --channel-url "https://www.youtube.com/@ChannelName" \
+    --batch-size 20 \
+    --batch-pause 15 \
+    --delay 1
+```
+
 ## Dependencies
 
 - `google-api-python-client` - YouTube Data API v3
@@ -210,7 +237,7 @@ Contributions welcome! Please open an issue or submit a pull request.
 - The script respects YouTube's Terms of Service
 - Transcripts are fetched using official APIs only (no scraping)
 - Only publicly available data is accessed
-- Rate limiting is handled automatically
+- Rate limiting is handled automatically with exponential backoff and configurable batch processing
 
 ## Author
 
